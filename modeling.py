@@ -5,16 +5,16 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import openai
-import rwkv
 import tiktoken
 import torch
 import torch.nn as nn
 import transformers
 from fire import Fire
-from peft import PeftModel
+try:
+    from peft import PeftModel
+except:
+    PeftModel = None
 from pydantic import BaseModel
-from rwkv.model import RWKV
-from rwkv.utils import PIPELINE
 from torchvision.datasets.utils import download_url
 from transformers import AutoTokenizer
 from transformers import (
@@ -31,10 +31,9 @@ from transformers import (
 import quant
 
 
-class EvalModel(BaseModel, arbitrary_types_allowed=True):
-    model_path: str
-    max_input_length: int = 512
-    max_output_length: int = 512
+class EvalModel:
+    def __init__(self):
+        pass
 
     def run(self, prompt: str, **kwargs) -> str:
         raise NotImplementedError
@@ -131,12 +130,12 @@ class OpenAIModel(EvalModel):
 
 
 class SeqToSeqModel(EvalModel):
-    model_path: str
-    model: Optional[PreTrainedModel]
-    tokenizer: Optional[PreTrainedTokenizer]
-    lora_path: str = ""
-    device: str = "cuda"
-    load_8bit: bool = False
+    def __init__(self):
+        self.lora_path: str = ""
+        self.device: str = "cuda"
+        self.load_8bit: bool = False
+        self.model = None
+        self.tokenizer = None
 
     def load(self):
         if self.model is None:
@@ -186,6 +185,11 @@ class SeqToSeqModel(EvalModel):
 
 
 class CausalModel(SeqToSeqModel):
+    def __init__(self, **kwargs):
+        super().__init__()
+        for key, val in kwargs.items():
+            setattr(self, key, val)
+
     def load(self):
         if self.model is None:
             args = {}
@@ -212,73 +216,6 @@ class CausalModel(SeqToSeqModel):
             **inputs,
             max_new_tokens=self.max_output_length,
             pad_token_id=self.tokenizer.eos_token_id,  # Avoid pad token warning
-            **kwargs,
-        )
-        batch_size, length = inputs.input_ids.shape
-        return self.tokenizer.decode(outputs[0, length:], skip_special_tokens=True)
-
-    def get_choice(self, text: str, **kwargs) -> Tuple[float, float]:
-        self.load()
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            predictions = self.model(
-                **inputs,
-                **kwargs,
-            ).logits[0, -1]
-        A_index = self.tokenizer("A", add_special_tokens=False).input_ids[0]
-        B_index = self.tokenizer("B", add_special_tokens=False).input_ids[0]
-        A = float(predictions[A_index].cpu())
-        B = float(predictions[B_index].cpu())
-        return A, B
-
-
-class LlamaModel(SeqToSeqModel):
-    use_template: bool = False
-    """
-    Not officially supported by AutoModelForCausalLM, so we need the specific class
-    Optionally, we can use the prompt template from: https://github.com/tatsu-lab/stanford_alpaca/blob/main/train.py
-    However, initial MMLU experiments indicate that the template is not useful for few-shot settings
-    """
-
-    def load(self):
-        if self.tokenizer is None:
-            self.tokenizer = LlamaTokenizer.from_pretrained(self.model_path)
-        if self.model is None:
-            args = {}
-            if self.load_8bit:
-                args.update(device_map="auto", load_in_8bit=True)
-            self.model = LlamaForCausalLM.from_pretrained(self.model_path, **args)
-            if self.lora_path:
-                self.model = PeftModel.from_pretrained(self.model, self.lora_path)
-            self.model.eval()
-            if not self.load_8bit:
-                self.model.to(self.device)
-
-    def run(self, prompt: str, **kwargs) -> str:
-        if self.use_template:
-            template = (
-                "Below is an instruction that describes a task. "
-                "Write a response that appropriately completes the request.\n\n"
-                "### Instruction:\n{instruction}\n\n### Response:"
-            )
-            text = template.format_map(dict(instruction=prompt))
-        else:
-            text = prompt
-
-        self.load()
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-        if "65b" in self.model_path.lower():
-            self.max_input_length = 1024
-            inputs = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_input_length,
-            ).to(self.device)
-
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=self.max_output_length,
             **kwargs,
         )
         batch_size, length = inputs.input_ids.shape
@@ -367,137 +304,11 @@ def load_quant(
     return model
 
 
-class GPTQModel(LlamaModel):
-    quantized_path: str
-    model: Optional[LlamaForCausalLM]
-    tokenizer: Optional[LlamaTokenizer]
-    num_bits: int = 4
-    group_size: int = 128
-
-    def load(self):
-        # https://github.com/qwopqwop200/GPTQ-for-LLaMa/blob/05781593c818d4dc8adc2d32c975e83d17d2b9a8/llama_inference.py
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        if not Path(self.quantized_path).exists():
-            url = f"https://huggingface.co/{self.model_path}/resolve/main/{self.quantized_path}"
-            download_url(url, root=".")
-
-        if self.model is None:
-            self.model = load_quant(
-                model=self.model_path,
-                checkpoint=self.quantized_path,
-                wbits=self.num_bits,
-                groupsize=self.group_size,
-            )
-            self.model.to(self.device)
-
-        if self.tokenizer is None:
-            self.tokenizer = LlamaTokenizer.from_pretrained(self.model_path)
-            self.test_max_length()
-
-    def test_max_length(self):
-        # Detect any OOMs at the beginning
-        text = " ".join(["test sentence for max length"] * 1000)
-        self.run(text)
-
-
-class ChatGLMModel(SeqToSeqModel):
-    def load(self):
-        if self.tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path, trust_remote_code=True
-            )
-        if self.model is None:
-            self.model = AutoModel.from_pretrained(
-                self.model_path, trust_remote_code=True
-            ).half()  # FP16 is required for ChatGLM
-            self.model.eval()
-            self.model.to(self.device)
-
-    def run(self, prompt: str, **kwargs) -> str:
-        self.load()
-        response, history = self.model.chat(
-            self.tokenizer,
-            prompt,
-            history=[],
-            **kwargs,
-        )
-        return response
-
-
-class RWKVModel(EvalModel):
-    tokenizer_path: str = (
-        "https://github.com/BlinkDL/ChatRWKV/raw/main/20B_tokenizer.json"
-    )
-    download_root: str = "."
-    model: Optional[rwkv.utils.PIPELINE]
-
-    def download(self, url: str) -> str:
-        path = Path(self.download_root, Path(url).name)
-        if not path.exists():
-            download_url(url, root=self.download_root)
-        return str(path)
-
-    def load(self):
-        model_path = self.download(self.model_path)
-        tokenizer_path = self.download(self.tokenizer_path)
-
-        if self.model is None:
-            model = RWKV(model=model_path, strategy="cuda fp16")
-            self.model = rwkv.utils.PIPELINE(model, tokenizer_path)
-
-    def run(self, prompt: str, **kwargs) -> str:
-        # Adapted from: https://github.com/BlinkDL/ChatRWKV/blob/main/v2/benchmark_more.py
-        self.load()
-        out_tokens = []
-        out_last = 0
-        out_str = ""
-        occurrence = {}
-        state = None
-        token = None
-
-        # ctx = f"Bob: {prompt.strip()}\n\nAlice:"
-        ctx = prompt  # Special format has lower few-shot performance
-
-        for i in range(self.max_output_length):
-            tokens = self.model.encode(ctx) if i == 0 else [token]
-
-            out, state = self.model.model.forward(tokens, state)
-            for n in occurrence:
-                out[n] -= 0.2 + occurrence[n] * 0.2
-
-            token = self.model.sample_logits(out, temperature=1.0, top_p=0)
-            if token == 0:
-                break  # exit when 'endoftext'
-
-            out_tokens += [token]
-            occurrence[token] = 1 + (occurrence[token] if token in occurrence else 0)
-
-            tmp = self.model.decode(out_tokens[out_last:])
-            if ("\ufffd" not in tmp) and (not tmp.endswith("\n")):
-                # only print when the string is valid utf-8 and not end with \n
-                out_str += tmp
-                out_last = i + 1
-
-            if "\n\n" in tmp:
-                break  # exit when '\n\n'
-
-        return out_str
-
-    def count_text_length(self, text: str) -> int:
-        self.load()
-        return len(self.model.encode(text))
-
-
 def select_model(model_name: str, **kwargs) -> EvalModel:
     model_map = dict(
         seq_to_seq=SeqToSeqModel,
         causal=CausalModel,
-        llama=LlamaModel,
-        chatglm=ChatGLMModel,
         openai=OpenAIModel,
-        rwkv=RWKVModel,
-        gptq=GPTQModel,
     )
     model_class = model_map.get(model_name)
     if model_class is None:
